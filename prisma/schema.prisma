@@ -1,0 +1,90 @@
+generator client {
+  provider      = "prisma-client-js"
+  binaryTargets = ["native", "linux-musl-openssl-3.0.x"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("SCHEDULER_DATABASE_URL")
+}
+
+enum ScheduleType {
+  CRON
+  INTERVAL
+  ONCE
+}
+
+enum TaskStatus {
+  ACTIVE
+  PAUSED
+  COMPLETED
+  FAILED
+}
+
+enum ExecutionStatus {
+  SUCCESS
+  FAILED
+  SKIPPED_LATE
+}
+
+model ScheduledTask {
+  id          String  @id @default(uuid())
+  name        String
+  description String?
+
+  // Schedule
+  scheduleType   ScheduleType
+  cronExpression String?
+  intervalMs     Int?
+  runAt          DateTime?
+  timezone       String       @default("America/Bogota")
+
+  // Target — what makes this scheduler agnostic
+  targetExchange   String @default("channels")
+  targetRoutingKey String
+  payload          Json
+
+  // Reliability
+  status         TaskStatus @default(ACTIVE)
+  maxRetries     Int        @default(3)
+  retryBackoffMs Int        @default(60000)
+  maxLatenessMs  Int        @default(300000) // 5 min grace window
+
+  // BullMQ link
+  bullSchedulerId String? @unique
+
+  // Audit
+  createdBy String?
+
+  // Stats
+  fireCount     Int       @default(0)
+  failureCount  Int       @default(0)
+  lastFiredAt   DateTime?
+  lastStatus    String?
+  nextFireAt    DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  executions TaskExecution[]
+
+  @@index([status, nextFireAt])
+}
+
+model TaskExecution {
+  id   String @id @default(uuid())
+  task ScheduledTask @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  taskId String
+
+  scheduledFor DateTime
+  firedAt      DateTime        @default(now())
+  latencyMs    Int
+  status       ExecutionStatus
+  error        String?
+  publishedTo  String
+
+  idempotencyKey String @unique
+
+  @@index([taskId, firedAt])
+  @@index([status])
+}
