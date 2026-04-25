@@ -6,10 +6,19 @@ import { TasksService } from '../tasks/tasks.service';
 import { CreateTaskDto } from '../tasks/dto/create-task.dto';
 import { UpdateTaskDto } from '../tasks/dto/update-task.dto';
 
+interface RpcEnvelope {
+  correlationId?: string;
+  [k: string]: unknown;
+}
+
 /**
- * Bridges RabbitMQ messages from the gateway (or any other publisher) into
- * the TasksService. The HTTP controller is the same surface — both routes
- * lead to the same service methods.
+ * Bridges RabbitMQ messages from the gateway into the TasksService.
+ *
+ * RPC pattern: every inbound message MAY carry a `correlationId`. If it does,
+ * we publish a response on `ROUTING_KEYS.RESPONSE` echoing the same id and
+ * a `success` flag. The gateway side resolves a pending promise by id.
+ *
+ * Fire-and-forget endpoints (TRIGGER_NOW) ignore correlationId.
  */
 @Injectable()
 export class SchedulerConsumer implements OnModuleInit {
@@ -21,53 +30,90 @@ export class SchedulerConsumer implements OnModuleInit {
   ) {}
 
   async onModuleInit() {
-    await this.rabbitmq.subscribe(QUEUES.CREATE, ROUTING_KEYS.CREATE, (p) =>
-      this.handleCreate(p),
-    );
-    await this.rabbitmq.subscribe(QUEUES.UPDATE, ROUTING_KEYS.UPDATE, (p) =>
-      this.handleUpdate(p),
-    );
-    await this.rabbitmq.subscribe(QUEUES.DELETE, ROUTING_KEYS.DELETE, (p) =>
-      this.handleDelete(p),
-    );
-    await this.rabbitmq.subscribe(QUEUES.TRIGGER_NOW, ROUTING_KEYS.TRIGGER_NOW, (p) =>
-      this.handleTrigger(p),
-    );
+    // Writes
+    await this.rabbitmq.subscribe(QUEUES.CREATE, ROUTING_KEYS.CREATE, (p) => this.handle(p, 'create'));
+    await this.rabbitmq.subscribe(QUEUES.UPDATE, ROUTING_KEYS.UPDATE, (p) => this.handle(p, 'update'));
+    await this.rabbitmq.subscribe(QUEUES.DELETE, ROUTING_KEYS.DELETE, (p) => this.handle(p, 'delete'));
+    await this.rabbitmq.subscribe(QUEUES.PAUSE, ROUTING_KEYS.PAUSE, (p) => this.handle(p, 'pause'));
+    await this.rabbitmq.subscribe(QUEUES.RESUME, ROUTING_KEYS.RESUME, (p) => this.handle(p, 'resume'));
+    await this.rabbitmq.subscribe(QUEUES.TRIGGER_NOW, ROUTING_KEYS.TRIGGER_NOW, (p) => this.handle(p, 'trigger'));
+
+    // Reads
+    await this.rabbitmq.subscribe(QUEUES.LIST, ROUTING_KEYS.LIST, (p) => this.handle(p, 'list'));
+    await this.rabbitmq.subscribe(QUEUES.GET, ROUTING_KEYS.GET, (p) => this.handle(p, 'get'));
+    await this.rabbitmq.subscribe(QUEUES.RUNS, ROUTING_KEYS.RUNS, (p) => this.handle(p, 'runs'));
   }
 
-  private async handleCreate(payload: Record<string, unknown>): Promise<void> {
-    const dto = payload as unknown as CreateTaskDto;
-    this.logger.log(`[create] name=${dto.name} target=${dto.targetRoutingKey}`);
-    await this.tasks.create(dto);
-  }
+  private async handle(payload: Record<string, unknown>, op: string): Promise<void> {
+    const env = payload as RpcEnvelope;
+    const correlationId = env.correlationId;
+    this.logger.log(`[${op}] correlationId=${correlationId ?? 'none'}`);
 
-  private async handleUpdate(payload: Record<string, unknown>): Promise<void> {
-    const { id, ...rest } = payload as { id: string } & Record<string, unknown>;
-    if (!id) {
-      this.logger.warn('[update] missing id in payload');
-      return;
+    try {
+      const data = await this.dispatch(op, env);
+      if (correlationId) this.respond(correlationId, true, data);
+    } catch (err) {
+      const message = (err as Error).message;
+      this.logger.error(`[${op}] failed: ${message}`);
+      if (correlationId) this.respond(correlationId, false, { error: message });
     }
-    this.logger.log(`[update] id=${id}`);
-    await this.tasks.update(id, rest as unknown as UpdateTaskDto);
   }
 
-  private async handleDelete(payload: Record<string, unknown>): Promise<void> {
-    const { id } = payload as { id: string };
-    if (!id) {
-      this.logger.warn('[delete] missing id in payload');
-      return;
+  private async dispatch(op: string, env: RpcEnvelope): Promise<unknown> {
+    switch (op) {
+      case 'create': {
+        const { correlationId: _c, ...dto } = env;
+        return this.tasks.create(dto as unknown as CreateTaskDto);
+      }
+      case 'update': {
+        const { correlationId: _c, id, ...rest } = env as { id: string } & RpcEnvelope;
+        if (!id) throw new Error('id is required for update');
+        return this.tasks.update(id, rest as unknown as UpdateTaskDto);
+      }
+      case 'delete': {
+        const { id } = env as { id: string };
+        if (!id) throw new Error('id is required for delete');
+        await this.tasks.remove(id);
+        return { id, deleted: true };
+      }
+      case 'pause': {
+        const { id } = env as { id: string };
+        if (!id) throw new Error('id is required for pause');
+        return this.tasks.pause(id);
+      }
+      case 'resume': {
+        const { id } = env as { id: string };
+        if (!id) throw new Error('id is required for resume');
+        return this.tasks.resume(id);
+      }
+      case 'trigger': {
+        const { id } = env as { id: string };
+        if (!id) throw new Error('id is required for trigger');
+        await this.tasks.triggerNow(id);
+        return { id, triggered: true };
+      }
+      case 'list':
+        return { tasks: await this.tasks.list() };
+      case 'get': {
+        const { id } = env as { id: string };
+        if (!id) throw new Error('id is required for get');
+        return { task: await this.tasks.get(id) };
+      }
+      case 'runs': {
+        const { id, limit } = env as { id: string; limit?: number };
+        if (!id) throw new Error('id is required for runs');
+        return { runs: await this.tasks.listExecutions(id, limit ?? 50) };
+      }
+      default:
+        throw new Error(`Unknown op: ${op}`);
     }
-    this.logger.log(`[delete] id=${id}`);
-    await this.tasks.remove(id);
   }
 
-  private async handleTrigger(payload: Record<string, unknown>): Promise<void> {
-    const { id } = payload as { id: string };
-    if (!id) {
-      this.logger.warn('[trigger] missing id in payload');
-      return;
-    }
-    this.logger.log(`[trigger] id=${id}`);
-    await this.tasks.triggerNow(id);
+  private respond(correlationId: string, success: boolean, data: unknown): void {
+    this.rabbitmq.publish(ROUTING_KEYS.RESPONSE, {
+      correlationId,
+      success,
+      ...(typeof data === 'object' && data !== null ? (data as Record<string, unknown>) : { data }),
+    });
   }
 }
