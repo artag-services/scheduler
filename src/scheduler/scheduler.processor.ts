@@ -15,6 +15,7 @@ export class SchedulerProcessor extends WorkerHost {
   }
 
   async process(job: Job<FireJobData>): Promise<void> {
-    return this.fireTask.execute(job.data.taskId, new Date(job.timestamp));
+    const scheduledFor = new Date(job.timestamp + (job.opts.delay ?? 0));
+    return this.fireTask.execute(job.data.taskId, scheduledFor);
   }
 }
