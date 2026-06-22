@@ -1,6 +1,7 @@
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 
 import { RabbitMQService } from './rabbitmq.service';
+import { IMessageBus } from '../domain/ports/IMessageBus';
 import { QUEUES, ROUTING_KEYS } from './constants/queues';
 import { TasksService } from '../tasks/tasks.service';
 import { CreateTaskDto } from '../tasks/dto/create-task.dto';
@@ -11,15 +12,6 @@ interface RpcEnvelope {
   [k: string]: unknown;
 }
 
-/**
- * Bridges RabbitMQ messages from the gateway into the TasksService.
- *
- * RPC pattern: every inbound message MAY carry a `correlationId`. If it does,
- * we publish a response on `ROUTING_KEYS.RESPONSE` echoing the same id and
- * a `success` flag. The gateway side resolves a pending promise by id.
- *
- * Fire-and-forget endpoints (TRIGGER_NOW) ignore correlationId.
- */
 @Injectable()
 export class SchedulerConsumer implements OnModuleInit {
   private readonly logger = new Logger(SchedulerConsumer.name);
@@ -27,18 +19,16 @@ export class SchedulerConsumer implements OnModuleInit {
   constructor(
     private readonly rabbitmq: RabbitMQService,
     private readonly tasks: TasksService,
+    private readonly bus: IMessageBus,
   ) {}
 
   async onModuleInit() {
-    // Writes
     await this.rabbitmq.subscribe(QUEUES.CREATE, ROUTING_KEYS.CREATE, (p) => this.handle(p, 'create'));
     await this.rabbitmq.subscribe(QUEUES.UPDATE, ROUTING_KEYS.UPDATE, (p) => this.handle(p, 'update'));
     await this.rabbitmq.subscribe(QUEUES.DELETE, ROUTING_KEYS.DELETE, (p) => this.handle(p, 'delete'));
     await this.rabbitmq.subscribe(QUEUES.PAUSE, ROUTING_KEYS.PAUSE, (p) => this.handle(p, 'pause'));
     await this.rabbitmq.subscribe(QUEUES.RESUME, ROUTING_KEYS.RESUME, (p) => this.handle(p, 'resume'));
     await this.rabbitmq.subscribe(QUEUES.TRIGGER_NOW, ROUTING_KEYS.TRIGGER_NOW, (p) => this.handle(p, 'trigger'));
-
-    // Reads
     await this.rabbitmq.subscribe(QUEUES.LIST, ROUTING_KEYS.LIST, (p) => this.handle(p, 'list'));
     await this.rabbitmq.subscribe(QUEUES.GET, ROUTING_KEYS.GET, (p) => this.handle(p, 'get'));
     await this.rabbitmq.subscribe(QUEUES.RUNS, ROUTING_KEYS.RUNS, (p) => this.handle(p, 'runs'));
@@ -110,7 +100,7 @@ export class SchedulerConsumer implements OnModuleInit {
   }
 
   private respond(correlationId: string, success: boolean, data: unknown): void {
-    this.rabbitmq.publish(ROUTING_KEYS.RESPONSE, {
+    this.bus.publish(ROUTING_KEYS.RESPONSE, {
       correlationId,
       success,
       ...(typeof data === 'object' && data !== null ? (data as Record<string, unknown>) : { data }),
